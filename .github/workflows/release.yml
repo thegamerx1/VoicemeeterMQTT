@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.x"
+
+      - name: Restore dependencies
+        run: dotnet restore
+        working-directory: ./Voicemeeter
+
+      - name: Build Release
+        run: dotnet publish -c Release -r win-x64 -p:PublishSingleFile=true
+          -p:PublishTrimmed=true -p:PublishReadyToRun=false -p:DebugType=None
+          -p:DebugSymbols=false -p:TrimMode=full --self-contained false
+        working-directory: ./Voicemeeter
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoicemeeterMQTT-win-x64
+          path: Voicemeeter/bin/Release/net10.0/win-x64/publish/
+
+      - name: Create Release
+        if: contains(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: Voicemeeter/bin/Release/net10.0/win-x64/publish/**/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
