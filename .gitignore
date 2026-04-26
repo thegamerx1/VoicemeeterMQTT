@@ -1,0 +1,26 @@
+## Compiled binaries and build artifacts
+bin/
+obj/
+*.exe
+*.dll
+*.so
+*.dylib
+
+## Visual Studio cache
+.vs/
+.vscode/settings.json
+.vscode/launch.json
+
+## Environment variables
+.env
+!.env.example
+
+## IDE
+*.swp
+*.swo
+*~
+.DS_Store
+
+## Dependencies
+packages/
+NuGetFallbackFolder/
