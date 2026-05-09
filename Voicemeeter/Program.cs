@@ -10,6 +10,8 @@ Log.Logger = new LoggerConfiguration()
 
 
 var exitTcs = new TaskCompletionSource();
+var cancellationSource = new CancellationTokenSource();
+
 try
 {
 	Log.Information("Starting Voicemeeter MQTT Service");
@@ -38,10 +40,11 @@ try
 		Log.Information("Created default config at {ConfigPath}", configPath);
 	}
 
-	if (!VoicemeeterInterop.LoadDll())
+	// Try to load DLL, but don't fail startup if it's not available yet
+	bool dllLoaded = VoicemeeterInterop.LoadDll();
+	if (!dllLoaded)
 	{
-		Log.Error("Failed to load VoicemeeterRemote.dll. Check Voicemeeter installation.");
-		return;
+		Log.Warning("Failed to load VoicemeeterRemote.dll. Will retry in background.");
 	}
 
 	await using var service = new VoicemeeterMqttService(config);
@@ -49,15 +52,20 @@ try
 	Console.CancelKeyPress += (s, e) =>
 	{
 		e.Cancel = true;
+		cancellationSource.Cancel();
 		exitTcs.TrySetResult();
 	};
 
 	AppDomain.CurrentDomain.ProcessExit += (_, __) =>
 	{
+		cancellationSource.Cancel();
 		exitTcs.TrySetResult();
 	};
 
 	await service.StartAsync();
+
+	// Start background DLL retry task if not loaded
+	var retryTask = !dllLoaded ? RetryLoadDllAsync(cancellationSource.Token) : Task.CompletedTask;
 
 	// Wait until exit signal
 	await exitTcs.Task;
@@ -70,4 +78,42 @@ catch (Exception ex)
 finally
 {
 	await Log.CloseAndFlushAsync();
+}
+
+/// <summary>
+/// Retries loading the Voicemeeter DLL in the background every 5 seconds
+/// </summary>
+static async Task RetryLoadDllAsync(CancellationToken cancellationToken)
+{
+	var retryInterval = TimeSpan.FromSeconds(5);
+	int retryCount = 0;
+
+	while (!cancellationToken.IsCancellationRequested)
+	{
+		try
+		{
+			await Task.Delay(retryInterval, cancellationToken);
+
+			if (VoicemeeterInterop.LoadDll())
+			{
+				Log.Information("Successfully loaded VoicemeeterRemote.dll on retry #{RetryCount}", retryCount);
+				return;
+			}
+
+			retryCount++;
+			if (retryCount % 12 == 0) // Log every 60 seconds (12 * 5 seconds)
+			{
+				Log.Debug("Still retrying to load VoicemeeterRemote.dll. Retry count: {RetryCount}", retryCount);
+			}
+		}
+		catch (OperationCanceledException)
+		{
+			// Application is shutting down
+			break;
+		}
+		catch (Exception ex)
+		{
+			Log.Error(ex, "Unexpected error during DLL retry");
+		}
+	}
 }
