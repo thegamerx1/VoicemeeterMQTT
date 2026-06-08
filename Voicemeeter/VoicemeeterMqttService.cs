@@ -16,6 +16,7 @@ public class VoicemeeterMqttService : IAsyncDisposable
 
 	private CancellationTokenSource? _cancellationSource;
 	private Task? _updateTask;
+	private Task? _initRetryTask;
 
 	// Cache last known values to avoid redundant publishes
 	private readonly Dictionary<string, object> _lastValues = new();
@@ -34,10 +35,15 @@ public class VoicemeeterMqttService : IAsyncDisposable
 	{
 		try
 		{
+			_cancellationSource = new CancellationTokenSource();
+
 			// Initialize components
-			if (!_voicemeeter.Initialize())
+			bool voicemeeterInitialized = _voicemeeter.Initialize();
+			if (!voicemeeterInitialized)
 			{
-				Log.Warning("Voicemeeter not available - will run in audio-only mode");
+				Log.Warning("Voicemeeter not available - will run in audio-only mode and retry in background");
+				// Start background retry task
+				_initRetryTask = RetryVoicemeeterInitAsync(_cancellationSource.Token);
 			}
 
 			_audioManager.Initialize();
@@ -60,7 +66,6 @@ public class VoicemeeterMqttService : IAsyncDisposable
 				await _mqtt.SubscribeAsync($"{_config.BaseTopic}/bus{i}/+/set");
 			}
 
-			_cancellationSource = new CancellationTokenSource();
 			_updateTask = UpdateLoopAsync(_cancellationSource.Token);
 
 			Log.Information("VoicemeeterMqttService started");
@@ -515,6 +520,47 @@ public class VoicemeeterMqttService : IAsyncDisposable
 		}
 	}
 
+	/// <summary>
+	/// Retries Voicemeeter API initialization in the background every 5 seconds
+	/// Also attempts to reload the DLL in case it wasn't available initially
+	/// </summary>
+	private async Task RetryVoicemeeterInitAsync(CancellationToken cancellationToken)
+	{
+		var retryInterval = TimeSpan.FromSeconds(5);
+		int retryCount = 0;
+
+		while (!cancellationToken.IsCancellationRequested)
+		{
+			try
+			{
+				await Task.Delay(retryInterval, cancellationToken);
+
+				// Attempt to unload and reload the DLL in case it wasn't available initially
+				VoicemeeterInterop.UnloadDll();
+				if (VoicemeeterInterop.LoadDll() && _voicemeeter.Initialize())
+				{
+					Log.Information("Successfully initialized Voicemeeter API on retry #{RetryCount}", retryCount);
+					return;
+				}
+
+				retryCount++;
+				if (retryCount % 12 == 0) // Log every 60 seconds (12 * 5 seconds)
+				{
+					Log.Debug("Still retrying to initialize Voicemeeter API. Retry count: {RetryCount}", retryCount);
+				}
+			}
+			catch (OperationCanceledException)
+			{
+				// Cancellation requested, exit gracefully
+				break;
+			}
+			catch (Exception ex)
+			{
+				Log.Error(ex, "Unexpected error during Voicemeeter initialization retry");
+			}
+		}
+	}
+
 	public async ValueTask DisposeAsync()
 	{
 		if (!_disposed)
@@ -527,6 +573,15 @@ public class VoicemeeterMqttService : IAsyncDisposable
 				try
 				{
 					await _updateTask;
+				}
+				catch (OperationCanceledException) { }
+			}
+
+			if (_initRetryTask != null)
+			{
+				try
+				{
+					await _initRetryTask;
 				}
 				catch (OperationCanceledException) { }
 			}

@@ -60,6 +60,32 @@ public static class VoicemeeterInterop
 		}
 	}
 
+	public static void UnloadDll()
+	{
+		if (_dllHandle != IntPtr.Zero)
+		{
+			try
+			{
+				NativeLibrary.Free(_dllHandle);
+				_dllHandle = IntPtr.Zero;
+				// Clear delegates
+				_login = null;
+				_logout = null;
+				_getParameterFloat = null;
+				_setParameterFloat = null;
+				_isParameterQueueNotEmpty = null;
+				_getLevel = null;
+				_isParametersDirty = null;
+				_getParameterString = null;
+				Log.Debug("Unloaded VoicemeeterRemote.dll");
+			}
+			catch (Exception ex)
+			{
+				Log.Error(ex, "Error unloading VoicemeeterRemote.dll");
+			}
+		}
+	}
+
 	private static T? GetDelegate<T>(string functionName) where T : Delegate
 	{
 		if (_dllHandle == IntPtr.Zero) return null;
