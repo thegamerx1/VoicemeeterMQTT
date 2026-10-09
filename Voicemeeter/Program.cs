@@ -1,119 +1,90 @@
-﻿using Serilog;
-using VoicemeeterMQTT;
 using System.Text.Json;
+using Serilog;
+using VoicemeeterMQTT;
 
-// Configure Serilog for minimal overhead
+static void WriteAllTextAtomic(string path, string contents)
+{
+    var temp = path + ".tmp";
+    File.WriteAllText(temp, contents);
+    File.Move(temp, path, overwrite: true);
+}
+
+static FileStream AcquireSingleInstanceLock(string appDataPath)
+{
+    var lockPath = Path.Combine(appDataPath, "service.lock");
+    try
+    {
+        return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+    }
+    catch (IOException ex)
+    {
+        throw new InvalidOperationException("Another VoicemeeterMQTT instance is already running for this user.", ex);
+    }
+}
+
 Log.Logger = new LoggerConfiguration()
-	 .MinimumLevel.Debug()
-	 .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss}] {Level:u3} {Message:lj}{NewLine}{Exception}")
-	 .CreateLogger();
+    .MinimumLevel.Debug()
+    .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss}] {Level:u3} {Message:lj}{NewLine}{Exception}")
+    .CreateLogger();
 
-
-var exitTcs = new TaskCompletionSource();
-var cancellationSource = new CancellationTokenSource();
+var exitTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+var exitCode = 0;
 
 try
 {
-	Log.Information("Starting Voicemeeter MQTT Service");
-	var appDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "voicemeetermqtt");
-	var configPath = Path.Combine(appDataPath, "config.json");
+    Log.Information("Starting Voicemeeter MQTT Service");
+    var appDataPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "voicemeetermqtt");
+    var configPath = Path.Combine(appDataPath, "config.json");
+    Directory.CreateDirectory(appDataPath);
+    using var instanceLock = AcquireSingleInstanceLock(appDataPath);
 
-	MqttConfig config;
-	if (File.Exists(configPath))
-	{
-		var json = File.ReadAllText(configPath);
-		config = JsonSerializer.Deserialize(json, AppJsonContext.Default.MqttConfig) ?? new MqttConfig();
-		Log.Information("Loaded config from {ConfigPath}", configPath);
-	}
-	else
-	{
-		Log.Warning("Config file not found at {ConfigPath}. Using defaults.", configPath);
-		config = new MqttConfig();
+    MqttConfig config;
+    var configNeedsSave = false;
+    if (File.Exists(configPath))
+    {
+        var json = File.ReadAllText(configPath);
+        config = JsonSerializer.Deserialize(json, AppJsonContext.Default.MqttConfig) ?? new MqttConfig();
+        Log.Information("Loaded config from {ConfigPath}", configPath);
+    }
+    else
+    {
+        config = new MqttConfig();
+        configNeedsSave = true;
+        Log.Warning("Config file not found at {ConfigPath}; creating a safe default configuration", configPath);
+    }
 
-		// Create directory and save default config
-		Directory.CreateDirectory(appDataPath);
-		var defaultJson = JsonSerializer.Serialize(
-			config,
-			AppJsonContext.Default.MqttConfig
-		);
-		File.WriteAllText(configPath, defaultJson);
-		Log.Information("Created default config at {ConfigPath}", configPath);
-	}
+    configNeedsSave |= config.NormalizeAndValidate();
+    if (config.UseEncryption && config.SkipCertificateValidation)
+        Log.Warning("MQTT certificate validation is DISABLED. Use this only in a controlled test environment.");
 
-	// Try to load DLL, but don't fail startup if it's not available yet
-	bool dllLoaded = VoicemeeterInterop.LoadDll();
-	if (!dllLoaded)
-	{
-		Log.Warning("Failed to load VoicemeeterRemote.dll. Will retry in background.");
-	}
+    if (configNeedsSave)
+    {
+        WriteAllTextAtomic(configPath, JsonSerializer.Serialize(config, AppJsonContext.Default.MqttConfig));
+        Log.Information("Saved normalized config to {ConfigPath}", configPath);
+    }
 
-	await using var service = new VoicemeeterMqttService(config);
+    Console.CancelKeyPress += (_, e) =>
+    {
+        e.Cancel = true;
+        exitTcs.TrySetResult(true);
+    };
+    AppDomain.CurrentDomain.ProcessExit += (_, _) => exitTcs.TrySetResult(true);
 
-	Console.CancelKeyPress += (s, e) =>
-	{
-		e.Cancel = true;
-		cancellationSource.Cancel();
-		exitTcs.TrySetResult();
-	};
-
-	AppDomain.CurrentDomain.ProcessExit += (_, __) =>
-	{
-		cancellationSource.Cancel();
-		exitTcs.TrySetResult();
-	};
-
-	await service.StartAsync();
-
-	// Start background DLL retry task if not loaded
-	var retryTask = !dllLoaded ? RetryLoadDllAsync(cancellationSource.Token) : Task.CompletedTask;
-
-	// Wait until exit signal
-	await exitTcs.Task;
+    await using (var service = new VoicemeeterMqttService(config, appDataPath))
+    {
+        await service.StartAsync();
+        await exitTcs.Task;
+    }
 }
 catch (Exception ex)
 {
-	Log.Fatal(ex, "Application terminated unexpectedly");
-	Environment.Exit(1);
+    exitCode = 1;
+    Log.Fatal(ex, "Application terminated unexpectedly");
 }
 finally
 {
-	await Log.CloseAndFlushAsync();
-}
-
-/// <summary>
-/// Retries loading the Voicemeeter DLL in the background every 5 seconds
-/// </summary>
-static async Task RetryLoadDllAsync(CancellationToken cancellationToken)
-{
-	var retryInterval = TimeSpan.FromSeconds(5);
-	int retryCount = 0;
-
-	while (!cancellationToken.IsCancellationRequested)
-	{
-		try
-		{
-			await Task.Delay(retryInterval, cancellationToken);
-
-			if (VoicemeeterInterop.LoadDll())
-			{
-				Log.Information("Successfully loaded VoicemeeterRemote.dll on retry #{RetryCount}", retryCount);
-				return;
-			}
-
-			retryCount++;
-			if (retryCount % 12 == 0) // Log every 60 seconds (12 * 5 seconds)
-			{
-				Log.Debug("Still retrying to load VoicemeeterRemote.dll. Retry count: {RetryCount}", retryCount);
-			}
-		}
-		catch (OperationCanceledException)
-		{
-			// Application is shutting down
-			break;
-		}
-		catch (Exception ex)
-		{
-			Log.Error(ex, "Unexpected error during DLL retry");
-		}
-	}
+    Environment.ExitCode = exitCode;
+    await Log.CloseAndFlushAsync();
 }
