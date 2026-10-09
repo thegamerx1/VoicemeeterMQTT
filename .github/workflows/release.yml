@@ -19,27 +19,38 @@ jobs:
         with:
           dotnet-version: "10.0.201"
 
-      - name: Restore dependencies
-        run: dotnet restore
-        working-directory: ./Voicemeeter
+      - name: Restore application
+        run: dotnet restore ./Voicemeeter/Voicemeeter.csproj
 
-      - name: Build Release
-        run: dotnet publish -c Release -r win-x64 -p:PublishSingleFile=true
-          -p:PublishTrimmed=true -p:PublishReadyToRun=false -p:DebugType=None
-          -p:DebugSymbols=false -p:TrimMode=full --self-contained false
-        working-directory: ./Voicemeeter
+      - name: Restore self-tests
+        run: dotnet restore ./Voicemeeter.Tests/Voicemeeter.Tests.csproj
+
+      - name: Build application
+        run: dotnet build ./Voicemeeter/Voicemeeter.csproj -c Release --no-restore
+
+      - name: Build self-tests
+        run: dotnet build ./Voicemeeter.Tests/Voicemeeter.Tests.csproj -c Release --no-restore
+
+      - name: Run self-tests
+        run: dotnet run --project ./Voicemeeter.Tests/Voicemeeter.Tests.csproj -c Release --no-restore --no-build
+
+      - name: Restore win-x64 publish target
+        run: dotnet restore ./Voicemeeter/Voicemeeter.csproj -r win-x64
+
+      - name: Publish Release
+        run: dotnet publish ./Voicemeeter/Voicemeeter.csproj -c Release -r win-x64 -p:PublishSingleFile=true -p:PublishTrimmed=false -p:PublishReadyToRun=false -p:DebugType=None -p:DebugSymbols=false --self-contained false --no-restore
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: VoicemeeterMQTT-win-x64
-          path: Voicemeeter/bin/Release/net10.0/win-x64/publish/
+          path: Voicemeeter/bin/Release/**/win-x64/publish/
 
       - name: Create Release
         if: contains(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
-          files: Voicemeeter/bin/Release/net10.0/win-x64/publish/**/*
+          files: Voicemeeter/bin/Release/**/win-x64/publish/**/*
           draft: false
           prerelease: false
         env:
