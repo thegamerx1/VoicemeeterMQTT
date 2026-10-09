@@ -4,321 +4,447 @@ using Serilog;
 
 namespace VoicemeeterMQTT;
 
+public enum VoicemeeterPollResult
+{
+    Unavailable,
+    NoChanges,
+    Changed
+}
+
+public readonly record struct VoicemeeterTopology(int StripCount, int BusCount, int Type);
+
 /// <summary>
-/// P/Invoke wrapper for Voicemeeter Remote API
-/// Minimal, efficient access to Voicemeeter parameters
+/// Dynamic wrapper for Voicemeeter Remote API. DLL load/unload has one synchronized owner.
+/// The library is intentionally kept loaded during normal service operation.
 /// </summary>
 public static class VoicemeeterInterop
 {
-	private static IntPtr _dllHandle = IntPtr.Zero;
+    private static readonly object LifecycleLock = new();
+    private static IntPtr _dllHandle = IntPtr.Zero;
 
-	private static string? GetVoicemeeterDllPath()
-	{
-		var possiblePaths = new[]
-		{
-			Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "VB", "Voicemeeter", "VoicemeeterRemote64.dll"),
-			Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "VB", "Voicemeeter", "VoicemeeterRemote.dll"),
-			Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "VB", "Voicemeeter", "VoicemeeterRemote64.dll"),
-			Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "VB", "Voicemeeter", "VoicemeeterRemote.dll"),
-			Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "VB-Audio", "Voicemeeter", "VoicemeeterRemote64.dll"),
-			Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "VB-Audio", "Voicemeeter", "VoicemeeterRemote.dll"),
-			Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "VB-Audio", "Voicemeeter", "VoicemeeterRemote64.dll"),
-			Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "VB-Audio", "Voicemeeter", "VoicemeeterRemote.dll"),
-			"VoicemeeterRemote64.dll",
-			"VoicemeeterRemote.dll"
-		};
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int VbvmrLogin();
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int VbvmrLogout();
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int VbvmrGetParameterFloat([MarshalAs(UnmanagedType.LPStr)] string paramName, out float value);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int VbvmrSetParameterFloat([MarshalAs(UnmanagedType.LPStr)] string paramName, float value);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int VbvmrGetLevel(int nuType, int nuChannel, out float value);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int VbvmrIsParametersDirty();
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int VbvmrGetParameterStringA([MarshalAs(UnmanagedType.LPStr)] string paramName, [MarshalAs(UnmanagedType.LPStr)] StringBuilder value);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int VbvmrGetVoicemeeterType(out int type);
 
-		foreach (var path in possiblePaths)
-		{
-			if (File.Exists(path))
-			{
-				Log.Debug("Found Voicemeeter DLL at {Path}", path);
-				return path;
-			}
-		}
-		return null;
-	}
+    private static VbvmrLogin? _login;
+    private static VbvmrLogout? _logout;
+    private static VbvmrGetParameterFloat? _getParameterFloat;
+    private static VbvmrSetParameterFloat? _setParameterFloat;
+    private static VbvmrGetLevel? _getLevel;
+    private static VbvmrIsParametersDirty? _isParametersDirty;
+    private static VbvmrGetParameterStringA? _getParameterString;
+    private static VbvmrGetVoicemeeterType? _getVoicemeeterType;
 
-	public static bool LoadDll()
-	{
-		if (_dllHandle != IntPtr.Zero) return true;
+    public static bool IsLoaded
+    {
+        get
+        {
+            lock (LifecycleLock)
+                return _dllHandle != IntPtr.Zero;
+        }
+    }
 
-		string? dllPath = GetVoicemeeterDllPath();
-		if (dllPath == null) return false;
+    public static bool LoadDll()
+    {
+        lock (LifecycleLock)
+        {
+            if (_dllHandle != IntPtr.Zero)
+                return true;
 
-		try
-		{
-			_dllHandle = NativeLibrary.Load(dllPath);
-			Log.Information("Loaded VoicemeeterRemote.dll from {Path}", dllPath);
-			InitializeDelegates();
-			return true;
-		}
-		catch (Exception ex)
-		{
-			Log.Error(ex, "Failed to load VoicemeeterRemote.dll");
-			return false;
-		}
-	}
+            foreach (var candidate in GetDllCandidates())
+            {
+                if (Path.IsPathRooted(candidate) && !File.Exists(candidate))
+                    continue;
 
-	public static void UnloadDll()
-	{
-		if (_dllHandle != IntPtr.Zero)
-		{
-			try
-			{
-				NativeLibrary.Free(_dllHandle);
-				_dllHandle = IntPtr.Zero;
-				// Clear delegates
-				_login = null;
-				_logout = null;
-				_getParameterFloat = null;
-				_setParameterFloat = null;
-				_isParameterQueueNotEmpty = null;
-				_getLevel = null;
-				_isParametersDirty = null;
-				_getParameterString = null;
-				Log.Debug("Unloaded VoicemeeterRemote.dll");
-			}
-			catch (Exception ex)
-			{
-				Log.Error(ex, "Error unloading VoicemeeterRemote.dll");
-			}
-		}
-	}
+                IntPtr handle = IntPtr.Zero;
+                try
+                {
+                    handle = NativeLibrary.Load(candidate);
+                    _dllHandle = handle;
+                    BindDelegatesOrThrow();
+                    Log.Information("Loaded VoicemeeterRemote DLL from {Path}", candidate);
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Log.Debug(ex, "Could not use VoicemeeterRemote DLL candidate {Path}", candidate);
+                    ClearDelegates();
+                    _dllHandle = IntPtr.Zero;
+                    if (handle != IntPtr.Zero)
+                    {
+                        try { NativeLibrary.Free(handle); } catch { }
+                    }
+                }
+            }
 
-	private static T? GetDelegate<T>(string functionName) where T : Delegate
-	{
-		if (_dllHandle == IntPtr.Zero) return null;
-		try
-		{
-			IntPtr functionPtr = NativeLibrary.GetExport(_dllHandle, functionName);
-			return (T?)Marshal.GetDelegateForFunctionPointer(functionPtr, typeof(T));
-		}
-		catch { return null; }
-	}
+            return false;
+        }
+    }
 
-	[UnmanagedFunctionPointer(CallingConvention.StdCall)]
-	private delegate int VbvmrLogin();
+    public static void UnloadDll()
+    {
+        lock (LifecycleLock)
+        {
+            if (_dllHandle == IntPtr.Zero)
+                return;
 
-	[UnmanagedFunctionPointer(CallingConvention.StdCall)]
-	private delegate int VbvmrLogout();
+            try
+            {
+                NativeLibrary.Free(_dllHandle);
+                Log.Debug("Unloaded VoicemeeterRemote DLL");
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Error unloading VoicemeeterRemote DLL");
+            }
+            finally
+            {
+                _dllHandle = IntPtr.Zero;
+                ClearDelegates();
+            }
+        }
+    }
 
-	[UnmanagedFunctionPointer(CallingConvention.StdCall)]
-	private delegate int VbvmrGetParameterFloat([MarshalAs(UnmanagedType.LPStr)] string paramName, out float value);
+    private static IEnumerable<string> GetDllCandidates()
+    {
+        var programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+        var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        var names = Environment.Is64BitProcess
+            ? new[] { "VoicemeeterRemote64.dll", "VoicemeeterRemote.dll" }
+            : new[] { "VoicemeeterRemote.dll", "VoicemeeterRemote64.dll" };
 
-	[UnmanagedFunctionPointer(CallingConvention.StdCall)]
-	private delegate int VbvmrSetParameterFloat([MarshalAs(UnmanagedType.LPStr)] string paramName, float value);
+        foreach (var root in new[] { programFilesX86, programFiles })
+        {
+            foreach (var vendor in new[] { "VB", "VB-Audio" })
+            {
+                foreach (var name in names)
+                    yield return Path.Combine(root, vendor, "Voicemeeter", name);
+            }
+        }
 
-	[UnmanagedFunctionPointer(CallingConvention.StdCall)]
-	private delegate int VbvmrIsParameterQueueNotEmpty();
+        // Also allow normal Windows DLL search semantics.
+        foreach (var name in names)
+            yield return name;
+    }
 
-	[UnmanagedFunctionPointer(CallingConvention.StdCall)]
-	private delegate int VbvmrGetLevel(int nuType, int nuChannel, out float value);
+    private static void BindDelegatesOrThrow()
+    {
+        _login = GetRequiredDelegate<VbvmrLogin>("VBVMR_Login");
+        _logout = GetRequiredDelegate<VbvmrLogout>("VBVMR_Logout");
+        _getParameterFloat = GetRequiredDelegate<VbvmrGetParameterFloat>("VBVMR_GetParameterFloat");
+        _setParameterFloat = GetRequiredDelegate<VbvmrSetParameterFloat>("VBVMR_SetParameterFloat");
+        _getLevel = GetRequiredDelegate<VbvmrGetLevel>("VBVMR_GetLevel");
+        _getParameterString = GetRequiredDelegate<VbvmrGetParameterStringA>("VBVMR_GetParameterStringA");
+        _isParametersDirty = GetRequiredDelegate<VbvmrIsParametersDirty>("VBVMR_IsParametersDirty");
+        _getVoicemeeterType = GetOptionalDelegate<VbvmrGetVoicemeeterType>("VBVMR_GetVoicemeeterType");
+    }
 
-	[UnmanagedFunctionPointer(CallingConvention.StdCall)]
-	private delegate int VbvmrIsParametersDirty();
+    private static T GetRequiredDelegate<T>(string name) where T : Delegate
+    {
+        if (_dllHandle == IntPtr.Zero || !NativeLibrary.TryGetExport(_dllHandle, name, out var address))
+            throw new MissingMethodException($"Required Voicemeeter export '{name}' was not found.");
+        return Marshal.GetDelegateForFunctionPointer<T>(address);
+    }
 
-	[UnmanagedFunctionPointer(CallingConvention.StdCall)]
-	private delegate int VbvmrGetParameterStringA([MarshalAs(UnmanagedType.LPStr)] string paramName, [MarshalAs(UnmanagedType.LPStr)] StringBuilder value);
+    private static T? GetOptionalDelegate<T>(string name) where T : Delegate
+    {
+        if (_dllHandle == IntPtr.Zero || !NativeLibrary.TryGetExport(_dllHandle, name, out var address))
+            return null;
+        return Marshal.GetDelegateForFunctionPointer<T>(address);
+    }
 
-	private static VbvmrLogin? _login;
-	private static VbvmrLogout? _logout;
-	private static VbvmrGetParameterFloat? _getParameterFloat;
-	private static VbvmrSetParameterFloat? _setParameterFloat;
-	private static VbvmrIsParameterQueueNotEmpty? _isParameterQueueNotEmpty;
-	private static VbvmrGetLevel? _getLevel;
-	private static VbvmrIsParametersDirty? _isParametersDirty;
-	private static VbvmrGetParameterStringA? _getParameterString;
+    private static void ClearDelegates()
+    {
+        _login = null;
+        _logout = null;
+        _getParameterFloat = null;
+        _setParameterFloat = null;
+        _getLevel = null;
+        _isParametersDirty = null;
+        _getParameterString = null;
+        _getVoicemeeterType = null;
+    }
 
-	private static void InitializeDelegates()
-	{
-		_login = GetDelegate<VbvmrLogin>("VBVMR_Login");
-		_logout = GetDelegate<VbvmrLogout>("VBVMR_Logout");
-		_getParameterFloat = GetDelegate<VbvmrGetParameterFloat>("VBVMR_GetParameterFloat");
-		_setParameterFloat = GetDelegate<VbvmrSetParameterFloat>("VBVMR_SetParameterFloat");
-		_isParameterQueueNotEmpty = GetDelegate<VbvmrIsParameterQueueNotEmpty>("VBVMR_IsParameterQueueNotEmpty");
-		_getLevel = GetDelegate<VbvmrGetLevel>("VBVMR_GetLevel");
-		_getParameterString = GetDelegate<VbvmrGetParameterStringA>("VBVMR_GetParameterStringA");
-		_isParametersDirty = GetDelegate<VbvmrIsParametersDirty>("VBVMR_IsParametersDirty");
-	}
+    // Every native call shares the same lifecycle lock as load/unload. This guarantees that
+    // NativeLibrary.Free cannot run while a delegate is executing, even if this static wrapper
+    // is used outside VoicemeeterAPI in the future.
+    public static int VBVMR_Login()
+    {
+        lock (LifecycleLock)
+            return _login?.Invoke() ?? -1;
+    }
 
-	public static int VBVMR_Login() => _login?.Invoke() ?? -1;
-	public static int VBVMR_Logout() => _logout?.Invoke() ?? -1;
-	public static int VBVMR_GetParameterFloat(string paramName, out float value)
-	{
-		value = 0;
-		return _getParameterFloat?.Invoke(paramName, out value) ?? -1;
-	}
-	public static int VBVMR_SetParameterFloat(string paramName, float value) => _setParameterFloat?.Invoke(paramName, value) ?? -1;
-	public static int VBVMR_IsParameterQueueNotEmpty() => _isParameterQueueNotEmpty?.Invoke() ?? -1;
-	public static int VBVMR_GetLevel(int nuType, int nuChannel, out float value)
-	{
-		value = 0;
-		return _getLevel?.Invoke(nuType, nuChannel, out value) ?? -1;
-	}
-	public static int VBVMR_GetParameterString(string paramName, StringBuilder value) => _getParameterString?.Invoke(paramName, value) ?? -1;
-	public static int VBVMR_IsParametersDirty() => _isParametersDirty?.Invoke() ?? -1;
+    public static int VBVMR_Logout()
+    {
+        lock (LifecycleLock)
+            return _logout?.Invoke() ?? -1;
+    }
+
+    public static int VBVMR_GetParameterFloat(string name, out float value)
+    {
+        lock (LifecycleLock)
+        {
+            value = 0;
+            return _getParameterFloat?.Invoke(name, out value) ?? -1;
+        }
+    }
+
+    public static int VBVMR_SetParameterFloat(string name, float value)
+    {
+        lock (LifecycleLock)
+            return _setParameterFloat?.Invoke(name, value) ?? -1;
+    }
+
+    public static int VBVMR_GetLevel(int type, int channel, out float value)
+    {
+        lock (LifecycleLock)
+        {
+            value = 0;
+            return _getLevel?.Invoke(type, channel, out value) ?? -1;
+        }
+    }
+
+    public static int VBVMR_GetParameterString(string name, StringBuilder value)
+    {
+        lock (LifecycleLock)
+            return _getParameterString?.Invoke(name, value) ?? -1;
+    }
+
+    public static int VBVMR_IsParametersDirty()
+    {
+        lock (LifecycleLock)
+            return _isParametersDirty?.Invoke() ?? -1;
+    }
+
+    public static int VBVMR_GetVoicemeeterType(out int type)
+    {
+        lock (LifecycleLock)
+        {
+            type = 0;
+            return _getVoicemeeterType?.Invoke(out type) ?? -1;
+        }
+    }
 }
 
 /// <summary>
-/// Wrapper class for safe Voicemeeter API access
+/// Serialized access to the Voicemeeter API. It does not unload the native DLL while calls can run.
 /// </summary>
-public class VoicemeeterAPI : IDisposable
+public sealed class VoicemeeterAPI : IDisposable
 {
-	private bool _isInitialized = false;
-	private readonly object _lockObj = new();
+    private readonly object _lockObj = new();
+    private bool _isInitialized;
 
-	public bool Initialize()
-	{
-		lock (_lockObj)
-		{
-			try
-			{
-				int result = VoicemeeterInterop.VBVMR_Login();
-				_isInitialized = result == 0;
+    public bool IsInitialized
+    {
+        get { lock (_lockObj) return _isInitialized; }
+    }
 
-				if (_isInitialized)
-				{
-					Log.Information("Voicemeeter API initialized successfully");
-				}
-				else
-				{
-					Log.Error("Failed to initialize Voicemeeter API. Code: {ResultCode}", result);
-				}
+    public bool Initialize()
+    {
+        lock (_lockObj)
+        {
+            if (_isInitialized)
+                return true;
+            if (!VoicemeeterInterop.LoadDll())
+                return false;
 
-				return _isInitialized;
-			}
-			catch (DllNotFoundException)
-			{
-				Log.Error("VoicemeeterRemote.dll not found. Please install Voicemeeter.");
-				return false;
-			}
-			catch (Exception ex)
-			{
-				Log.Error(ex, "Error initializing Voicemeeter API");
-				return false;
-			}
-		}
-	}
+            try
+            {
+                var result = VoicemeeterInterop.VBVMR_Login();
+                _isInitialized = result == 0;
+                if (_isInitialized)
+                    Log.Information("Voicemeeter API initialized successfully");
+                else
+                    Log.Warning("Voicemeeter API login failed with code {ResultCode}", result);
+                return _isInitialized;
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Error initializing Voicemeeter API");
+                _isInitialized = false;
+                return false;
+            }
+        }
+    }
 
-	public bool Update()
-	{
-		if (!_isInitialized) return false;
+    public VoicemeeterPollResult Poll()
+    {
+        lock (_lockObj)
+        {
+            if (!_isInitialized)
+                return VoicemeeterPollResult.Unavailable;
 
-		lock (_lockObj)
-		{
-			try
-			{
-				return VoicemeeterInterop.VBVMR_IsParametersDirty() == 1;
-			}
-			catch (Exception ex)
-			{
-				Log.Debug(ex, "Error checking if parameters are dirty");
-				return false;
-			}
-		}
-	}
+            try
+            {
+                var result = VoicemeeterInterop.VBVMR_IsParametersDirty();
+                if (result == 1)
+                    return VoicemeeterPollResult.Changed;
+                if (result == 0)
+                    return VoicemeeterPollResult.NoChanges;
 
-	public float? GetParameter(string paramName)
-	{
-		if (!_isInitialized) return null;
+                MarkUnavailable();
+                Log.Warning("Voicemeeter API became unavailable (dirty result {Result})", result);
+                return VoicemeeterPollResult.Unavailable;
+            }
+            catch (Exception ex)
+            {
+                MarkUnavailable();
+                Log.Warning(ex, "Voicemeeter API became unavailable while polling");
+                return VoicemeeterPollResult.Unavailable;
+            }
+        }
+    }
 
-		lock (_lockObj)
-		{
-			try
-			{
-				int result = VoicemeeterInterop.VBVMR_GetParameterFloat(paramName, out float value);
-				return result == 0 ? value : null;
-			}
-			catch (Exception ex)
-			{
-				Log.Debug(ex, "Error getting parameter {ParamName}", paramName);
-				return null;
-			}
-		}
-	}
+    private void MarkUnavailable()
+    {
+        try { VoicemeeterInterop.VBVMR_Logout(); } catch { }
+        _isInitialized = false;
+    }
 
-	public bool SetParameter(string paramName, float value)
-	{
-		if (!_isInitialized) return false;
+    public VoicemeeterTopology? GetTopology()
+    {
+        lock (_lockObj)
+        {
+            if (!_isInitialized)
+                return null;
 
-		lock (_lockObj)
-		{
-			try
-			{
-				int result = VoicemeeterInterop.VBVMR_SetParameterFloat(paramName, value);
-				return result == 0;
-			}
-			catch (Exception ex)
-			{
-				Log.Debug(ex, "Error setting parameter {ParamName} to {Value}", paramName, value);
-				return false;
-			}
-		}
-	}
+            if (VoicemeeterInterop.VBVMR_GetVoicemeeterType(out var type) == 0)
+            {
+                return type switch
+                {
+                    1 => new VoicemeeterTopology(3, 2, type),
+                    2 => new VoicemeeterTopology(5, 5, type),
+                    3 => new VoicemeeterTopology(8, 8, type),
+                    _ => ProbeTopology(type)
+                };
+            }
 
-	public float? GetLevel(int levelType, int channel)
-	{
-		if (!_isInitialized) return null;
+            return ProbeTopology(0);
+        }
+    }
 
-		lock (_lockObj)
-		{
-			try
-			{
-				int result = VoicemeeterInterop.VBVMR_GetLevel(levelType, channel, out float value);
-				return result == 0 ? value : null;
-			}
-			catch (Exception ex)
-			{
-				Log.Debug(ex, "Error getting level type={LevelType} channel={Channel}", levelType, channel);
-				return null;
-			}
-		}
-	}
+    private static VoicemeeterTopology ProbeTopology(int type)
+    {
+        var strips = 0;
+        for (var i = 0; i < 8; i++)
+        {
+            if (VoicemeeterInterop.VBVMR_GetParameterFloat($"Strip[{i}].Gain", out _) != 0)
+                break;
+            strips++;
+        }
 
-	public string? GetParameterString(string paramName)
-	{
-		if (!_isInitialized) return null;
+        var buses = 0;
+        for (var i = 0; i < 8; i++)
+        {
+            if (VoicemeeterInterop.VBVMR_GetParameterFloat($"Bus[{i}].Gain", out _) != 0)
+                break;
+            buses++;
+        }
 
-		lock (_lockObj)
-		{
-			try
-			{
-				var sb = new StringBuilder(512);
-				int result = VoicemeeterInterop.VBVMR_GetParameterString(paramName, sb);
-				if (result == 0)
-				{
-					string value = sb.ToString();
-					return string.IsNullOrWhiteSpace(value) ? null : value;
-				}
+        return new VoicemeeterTopology(strips, buses, type);
+    }
 
-				return null;
-			}
-			catch (Exception ex)
-			{
-				Log.Debug(ex, "Error getting string parameter {ParamName}", paramName);
-				return null;
-			}
-		}
-	}
+    public float? GetParameter(string paramName)
+    {
+        lock (_lockObj)
+        {
+            if (!_isInitialized)
+                return null;
+            try
+            {
+                var result = VoicemeeterInterop.VBVMR_GetParameterFloat(paramName, out var value);
+                return result == 0 ? value : null;
+            }
+            catch (Exception ex)
+            {
+                Log.Debug(ex, "Error getting parameter {ParamName}", paramName);
+                return null;
+            }
+        }
+    }
 
-	public void Dispose()
-	{
-		lock (_lockObj)
-		{
-			if (_isInitialized)
-			{
-				try
-				{
-					VoicemeeterInterop.VBVMR_Logout();
-					_isInitialized = false;
-					Log.Information("Voicemeeter API disconnected");
-				}
-				catch (Exception ex)
-				{
-					Log.Error(ex, "Error during Voicemeeter logout");
-				}
-			}
-		}
-	}
+    public bool SetParameter(string paramName, float value)
+    {
+        lock (_lockObj)
+        {
+            if (!_isInitialized)
+                return false;
+            try
+            {
+                return VoicemeeterInterop.VBVMR_SetParameterFloat(paramName, value) == 0;
+            }
+            catch (Exception ex)
+            {
+                Log.Debug(ex, "Error setting parameter {ParamName} to {Value}", paramName, value);
+                return false;
+            }
+        }
+    }
+
+    public float? GetLevel(int levelType, int channel)
+    {
+        lock (_lockObj)
+        {
+            if (!_isInitialized)
+                return null;
+            try
+            {
+                return VoicemeeterInterop.VBVMR_GetLevel(levelType, channel, out var value) == 0 ? value : null;
+            }
+            catch (Exception ex)
+            {
+                Log.Debug(ex, "Error getting level type={LevelType} channel={Channel}", levelType, channel);
+                return null;
+            }
+        }
+    }
+
+    public string? GetParameterString(string paramName)
+    {
+        lock (_lockObj)
+        {
+            if (!_isInitialized)
+                return null;
+            try
+            {
+                var sb = new StringBuilder(512);
+                if (VoicemeeterInterop.VBVMR_GetParameterString(paramName, sb) != 0)
+                    return null;
+                var value = sb.ToString();
+                return string.IsNullOrWhiteSpace(value) ? null : value;
+            }
+            catch (Exception ex)
+            {
+                Log.Debug(ex, "Error getting string parameter {ParamName}", paramName);
+                return null;
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_lockObj)
+        {
+            if (!_isInitialized)
+                return;
+            try
+            {
+                VoicemeeterInterop.VBVMR_Logout();
+                Log.Information("Voicemeeter API disconnected");
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Error during Voicemeeter logout");
+            }
+            finally
+            {
+                _isInitialized = false;
+            }
+        }
+    }
 }
