@@ -12,6 +12,12 @@ public static class MqttCommandParser
             return false;
 
         var relative = topic[prefix.Length..];
+        if (string.Equals(relative, "voicemeeter/restart/set", StringComparison.Ordinal))
+        {
+            target = new MqttCommandTarget("voicemeeter", 0, "restart");
+            return true;
+        }
+
         var parts = relative.Split('/');
         if (parts.Length != 3 || parts.Any(string.IsNullOrEmpty) || !string.Equals(parts[2], "set", StringComparison.Ordinal))
             return false;

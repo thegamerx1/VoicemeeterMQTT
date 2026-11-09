@@ -7,7 +7,8 @@ Control and monitor Voicemeeter and Windows audio endpoints from Home Assistant 
 - Automatic MQTT reconnect with exponential backoff and jitter
 - Retained Last Will availability
 - Deterministic resubscription and state reconciliation after every reconnect
-- Home Assistant device-based MQTT discovery
+- Home Assistant device-based MQTT discovery, with all Windows audio endpoints grouped under one Windows Audio device per installation
+- Home Assistant button to restart the Voicemeeter audio engine
 - Stable per-installation MQTT/Home Assistant identity
 - Retained authoritative gain/mute/audio snapshot state
 - Home Assistant birth handling for state refresh
@@ -97,6 +98,14 @@ Voicemeeter state and commands:
 
 The number of strips and buses is detected from the installed Voicemeeter edition rather than hard-coded.
 
+Restart the Voicemeeter audio engine:
+
+```text
+{effectiveBaseTopic}/voicemeeter/restart/set
+```
+
+Publish the exact payload `RESTART`, non-retained, with QoS 1. Home Assistant exposes this command as a configuration button on the Voicemeeter device. It requires both the service and Voicemeeter to be available. The command restarts the engine and briefly interrupts audio; it does not restart the Voicemeeter application or the MQTT service. Repeated requests received while a restart is pending or within 10 seconds of the previous accepted attempt are ignored. The service allows a one-second recovery grace period and waits up to 30 seconds for Voicemeeter to recover before publishing fresh state.
+
 Availability:
 
 ```text
@@ -118,10 +127,12 @@ Home Assistant discovery uses retained device discovery:
 
 ```text
 {DiscoveryPrefix}/device/voicemeeter-{InstanceId}/config
-{DiscoveryPrefix}/device/windows-audio-{InstanceId}-{endpointHash}/config
+{DiscoveryPrefix}/device/windows-audio-{InstanceId}/config
 ```
 
-Old per-entity discovery topics from earlier versions are tombstoned automatically.
+All active Windows playback and capture endpoints appear as entities on the same Windows Audio device. Entity names include the endpoint name and Playback/Capture direction. Endpoint state topics and entity unique IDs remain stable; only their Home Assistant device grouping changes.
+
+This grouping is a breaking change for existing Home Assistant device assignments. No dedicated migration is provided for the previous device-per-endpoint layout. If upgrading leaves old endpoint devices behind, remove the old retained discovery messages at `{DiscoveryPrefix}/device/windows-audio-{InstanceId}-{endpointHash}/config` by publishing an empty retained payload, remove any obsolete Home Assistant device entries, and restart the service. Existing legacy per-entity discovery cleanup remains unchanged.
 
 ## MQTT behavior
 

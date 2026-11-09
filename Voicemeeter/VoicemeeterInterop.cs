@@ -272,7 +272,7 @@ public sealed class VoicemeeterAPI : IDisposable
         }
     }
 
-    public VoicemeeterPollResult Poll()
+    public VoicemeeterPollResult Poll(bool preserveSessionOnUnavailable = false)
     {
         lock (_lockObj)
         {
@@ -287,12 +287,19 @@ public sealed class VoicemeeterAPI : IDisposable
                 if (result == 0)
                     return VoicemeeterPollResult.NoChanges;
 
+                // An audio-engine restart can interrupt communication without ending the login.
+                if (preserveSessionOnUnavailable)
+                    return VoicemeeterPollResult.Unavailable;
+
                 MarkUnavailable();
                 Log.Warning("Voicemeeter API became unavailable (dirty result {Result})", result);
                 return VoicemeeterPollResult.Unavailable;
             }
             catch (Exception ex)
             {
+                if (preserveSessionOnUnavailable)
+                    return VoicemeeterPollResult.Unavailable;
+
                 MarkUnavailable();
                 Log.Warning(ex, "Voicemeeter API became unavailable while polling");
                 return VoicemeeterPollResult.Unavailable;

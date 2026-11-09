@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Threading.Channels;
 using MQTTnet.Protocol;
 using Serilog;
@@ -18,6 +19,7 @@ public sealed class VoicemeeterMqttService : IAsyncDisposable
     private readonly VoicemeeterAPI _voicemeeter = new();
     private readonly AudioDeviceManager _audioManager = new();
     private readonly MqttPublisher _mqtt;
+    private readonly AudioEngineRestartCoordinator _audioEngineRestart;
     private readonly RuntimeStateStore _stateStore;
     private readonly BridgeRuntimeState _runtimeState;
     private readonly ConcurrentDictionary<string, string> _lastPublished = new(StringComparer.Ordinal);
@@ -31,6 +33,7 @@ public sealed class VoicemeeterMqttService : IAsyncDisposable
             FullMode = BoundedChannelFullMode.Wait
         });
     private readonly object _retrySync = new();
+    private readonly object _voicemeeterOperationSync = new();
 
     private CancellationTokenSource? _cancellationSource;
     private Task? _voicemeeterLoopTask;
@@ -39,6 +42,8 @@ public sealed class VoicemeeterMqttService : IAsyncDisposable
     private Task? _audioRetryTask;
     private Task? _haBirthTask;
     private Task? _mqttMessageTask;
+    private Task? _audioEngineRestartTask;
+    private int _audioEngineRestartGeneration;
     private VoicemeeterTopology _topology;
     private HashSet<string> _audioDeviceSignatures = new(StringComparer.Ordinal);
     private string _voicemeeterDiscoverySignature = string.Empty;
@@ -55,6 +60,9 @@ public sealed class VoicemeeterMqttService : IAsyncDisposable
     {
         _config = config;
         _mqtt = new MqttPublisher(config);
+        _audioEngineRestart = new AudioEngineRestartCoordinator(
+            RequestAudioEngineRestart,
+            WaitForAudioEngineRecoveryAsync);
         _stateStore = new RuntimeStateStore(appDataPath);
         _runtimeState = _stateStore.Load();
     }
@@ -215,12 +223,16 @@ public sealed class VoicemeeterMqttService : IAsyncDisposable
 
         if (_audioReady)
         {
-            foreach (var device in _audioManager.GetDevices())
+            var devices = _audioManager.GetDevices();
+            if (devices.Count > 0)
+            {
+                var discoveryTopic = $"{_config.DiscoveryPrefix}/device/windows-audio-{_config.InstanceId}/config";
+                desiredDiscovery[discoveryTopic] = BuildAudioDiscoveryJson(devices);
+            }
+
+            foreach (var device in devices)
             {
                 var key = AudioDeviceKey(device);
-                var discoveryTopic = $"{_config.DiscoveryPrefix}/device/windows-audio-{_config.InstanceId}-{key}/config";
-                desiredDiscovery[discoveryTopic] = BuildAudioDiscoveryJson(device, key);
-
                 var path = AudioDevicePath(device, key);
                 if (device.Volume.HasValue)
                     desiredRetained.Add($"{path}/volume");
@@ -306,6 +318,22 @@ public sealed class VoicemeeterMqttService : IAsyncDisposable
         {
             if (string.IsNullOrEmpty(payload))
                 continue;
+            if (string.Equals(topic,
+                    $"{_config.DiscoveryPrefix}/device/windows-audio-{_config.InstanceId}/config",
+                    StringComparison.Ordinal))
+            {
+                var removalPayload = BuildAudioComponentRemovalJson(payload);
+                if (removalPayload != null && !await _mqtt.PublishAsync(
+                        topic,
+                        removalPayload,
+                        retain: true,
+                        qos: MqttQualityOfServiceLevel.AtLeastOnce,
+                        cancellationToken: cancellationToken))
+                {
+                    allOk = false;
+                    continue;
+                }
+            }
             allOk &= await _mqtt.PublishAsync(
                 topic,
                 payload,
@@ -445,6 +473,22 @@ public sealed class VoicemeeterMqttService : IAsyncDisposable
                 $"{_config.InstanceId}_bus{i}_mute", "mdi:volume-mute");
         }
 
+        components["restart_audio_engine"] = new Dictionary<string, object?>
+        {
+            ["platform"] = "button",
+            ["has_entity_name"] = true,
+            ["name"] = "Restart audio engine",
+            ["unique_id"] = $"{_config.InstanceId}_restart_audio_engine",
+            ["command_topic"] = $"{BaseTopic}/voicemeeter/restart/set",
+            ["payload_press"] = "RESTART",
+            ["device_class"] = "restart",
+            ["entity_category"] = "config",
+            ["qos"] = 1,
+            ["retain"] = false,
+            ["availability"] = BackendAvailability(VoicemeeterStatusTopic),
+            ["availability_mode"] = "all"
+        };
+
         var root = new Dictionary<string, object?>
         {
             ["device"] = new Dictionary<string, object?>
@@ -499,58 +543,104 @@ public sealed class VoicemeeterMqttService : IAsyncDisposable
             ["availability_mode"] = "all"
         };
 
-    private string BuildAudioDiscoveryJson(AudioDevice device, string key)
+    private string BuildAudioDiscoveryJson(IReadOnlyList<AudioDevice> devices)
     {
-        var path = AudioDevicePath(device, key);
         var availability = BackendAvailability(AudioStatusTopic);
         var components = new Dictionary<string, object?>(StringComparer.Ordinal);
-        if (device.Volume.HasValue)
+        foreach (var device in devices)
         {
-            components["volume"] = new Dictionary<string, object?>
+            var key = AudioDeviceKey(device);
+            var path = AudioDevicePath(device, key);
+            var direction = device.Type == "playback" ? "Playback" : "Capture";
+            var name = $"{device.Name} ({direction})";
+            if (device.Volume.HasValue)
             {
-                ["platform"] = "sensor", ["has_entity_name"] = true, ["name"] = "Volume", ["unique_id"] = $"{_config.InstanceId}_{key}_volume",
-                ["state_topic"] = $"{path}/volume", ["unit_of_measurement"] = "%", ["state_class"] = "measurement",
-                ["qos"] = 1, ["availability"] = availability, ["availability_mode"] = "all"
+                components[$"{key}_volume"] = new Dictionary<string, object?>
+                {
+                    ["platform"] = "sensor", ["has_entity_name"] = true, ["name"] = $"{name} Volume", ["unique_id"] = $"{_config.InstanceId}_{key}_volume",
+                    ["state_topic"] = $"{path}/volume", ["unit_of_measurement"] = "%", ["state_class"] = "measurement",
+                    ["qos"] = 1, ["availability"] = availability, ["availability_mode"] = "all"
+                };
+            }
+            if (device.IsMuted.HasValue)
+            {
+                components[$"{key}_muted"] = new Dictionary<string, object?>
+                {
+                    ["platform"] = "binary_sensor", ["has_entity_name"] = true, ["name"] = $"{name} Muted", ["unique_id"] = $"{_config.InstanceId}_{key}_muted",
+                    ["state_topic"] = $"{path}/muted", ["payload_on"] = "true", ["payload_off"] = "false",
+                    ["qos"] = 1, ["availability"] = availability, ["availability_mode"] = "all"
+                };
+            }
+            if (device.PeakLevel.HasValue)
+            {
+                components[$"{key}_peak"] = new Dictionary<string, object?>
+                {
+                    ["platform"] = "sensor", ["has_entity_name"] = true, ["name"] = $"{name} Peak level", ["unique_id"] = $"{_config.InstanceId}_{key}_peak",
+                    ["state_topic"] = $"{path}/peak", ["unit_of_measurement"] = "%", ["state_class"] = "measurement",
+                    ["qos"] = 0, ["availability"] = availability, ["availability_mode"] = "all"
+                };
+            }
+            components[$"{key}_default"] = new Dictionary<string, object?>
+            {
+                ["platform"] = "binary_sensor", ["has_entity_name"] = true, ["name"] = $"{name} Default device", ["unique_id"] = $"{_config.InstanceId}_{key}_default",
+                ["state_topic"] = $"{path}/default", ["payload_on"] = "true", ["payload_off"] = "false",
+                ["entity_category"] = "diagnostic", ["qos"] = 1, ["availability"] = availability, ["availability_mode"] = "all"
             };
         }
-        if (device.IsMuted.HasValue)
-        {
-            components["muted"] = new Dictionary<string, object?>
-            {
-                ["platform"] = "binary_sensor", ["has_entity_name"] = true, ["name"] = "Muted", ["unique_id"] = $"{_config.InstanceId}_{key}_muted",
-                ["state_topic"] = $"{path}/muted", ["payload_on"] = "true", ["payload_off"] = "false",
-                ["qos"] = 1, ["availability"] = availability, ["availability_mode"] = "all"
-            };
-        }
-        if (device.PeakLevel.HasValue)
-        {
-            components["peak"] = new Dictionary<string, object?>
-            {
-                ["platform"] = "sensor", ["has_entity_name"] = true, ["name"] = "Peak level", ["unique_id"] = $"{_config.InstanceId}_{key}_peak",
-                ["state_topic"] = $"{path}/peak", ["unit_of_measurement"] = "%", ["state_class"] = "measurement",
-                ["qos"] = 0, ["availability"] = availability, ["availability_mode"] = "all"
-            };
-        }
-        components["default"] = new Dictionary<string, object?>
-        {
-            ["platform"] = "binary_sensor", ["has_entity_name"] = true, ["name"] = "Default device", ["unique_id"] = $"{_config.InstanceId}_{key}_default",
-            ["state_topic"] = $"{path}/default", ["payload_on"] = "true", ["payload_off"] = "false",
-            ["entity_category"] = "diagnostic", ["qos"] = 1, ["availability"] = availability, ["availability_mode"] = "all"
-        };
 
         var root = new Dictionary<string, object?>
         {
             ["device"] = new Dictionary<string, object?>
             {
-                ["identifiers"] = new[] { $"windows-audio-{_config.InstanceId}-{key}" },
-                ["name"] = device.Name,
+                ["identifiers"] = new[] { $"windows-audio-{_config.InstanceId}" },
+                ["name"] = $"Windows Audio ({Environment.MachineName})",
                 ["manufacturer"] = "Microsoft Windows",
-                ["model"] = device.Type == "playback" ? "Audio Playback Endpoint" : "Audio Capture Endpoint"
+                ["model"] = "Windows Audio Endpoints"
             },
             ["origin"] = Origin(),
             ["components"] = components
         };
         return JsonSerializer.Serialize(root);
+    }
+
+    private string? BuildAudioComponentRemovalJson(string desiredPayload)
+    {
+        var root = JsonNode.Parse(desiredPayload)!.AsObject();
+        var components = root["components"]!.AsObject();
+        var prefix = $"{BaseTopic}/audio/";
+        var hasRemovals = false;
+        var metrics = new[]
+        {
+            (Name: "volume", Platform: "sensor"),
+            (Name: "muted", Platform: "binary_sensor"),
+            (Name: "peak", Platform: "sensor"),
+            (Name: "default", Platform: "binary_sensor")
+        };
+
+        // Every endpoint owns a retained default topic, including endpoints whose other
+        // capabilities are unknown. Reuse this ownership record for dynamic entity removal.
+        foreach (var topic in _runtimeState.RetainedTopics)
+        {
+            if (!topic.StartsWith(prefix, StringComparison.Ordinal))
+                continue;
+            var parts = topic[prefix.Length..].Split('/');
+            if (parts.Length != 3 || parts[0] is not ("playback" or "capture") ||
+                parts[1].Length != 16 || !parts[1].All(char.IsAsciiHexDigit) || parts[2] != "default")
+                continue;
+
+            foreach (var metric in metrics)
+            {
+                var componentKey = $"{parts[1]}_{metric.Name}";
+                if (components.ContainsKey(componentKey))
+                    continue;
+                components[componentKey] = new JsonObject { ["platform"] = metric.Platform };
+                hasRemovals = true;
+            }
+        }
+
+        // Home Assistant requires explicit platform-only entries before the final config
+        // omits a removed component; omission alone leaves the old entity registered.
+        return hasRemovals ? root.ToJsonString() : null;
     }
 
     private Dictionary<string, object?> Origin() => new()
@@ -569,12 +659,14 @@ public sealed class VoicemeeterMqttService : IAsyncDisposable
     private async Task<bool> PublishFullSnapshotAsync(CancellationToken cancellationToken)
     {
         var allOk = true;
-        if (_voicemeeterReady)
+        var restartGeneration = Volatile.Read(ref _audioEngineRestartGeneration);
+        if (_voicemeeterReady && !_audioEngineRestart.IsRestarting)
         {
             var vmSnapshotOk = await CheckVoicemeeterStateAsync(force: true, cancellationToken);
             allOk &= vmSnapshotOk;
             if (!vmSnapshotOk)
-                await MarkVoicemeeterUnavailableAsync("authoritative state snapshot failed", cancellationToken);
+                await MarkVoicemeeterUnavailableAsync(
+                    "authoritative state snapshot failed", cancellationToken, restartGeneration);
         }
         if (_audioReady)
             allOk &= await PublishAudioStateAsync(force: true, cancellationToken);
@@ -588,7 +680,23 @@ public sealed class VoicemeeterMqttService : IAsyncDisposable
         {
             try
             {
-                var poll = _voicemeeter.Poll();
+                VoicemeeterPollResult poll;
+                int restartGeneration;
+                lock (_voicemeeterOperationSync)
+                {
+                    restartGeneration = _audioEngineRestartGeneration;
+                    // Coordinate the native request with polling that can close a failed session.
+                    // The restart task owns polling throughout the expected interruption.
+                    poll = _audioEngineRestart.IsRestarting
+                        ? VoicemeeterPollResult.NoChanges
+                        : _voicemeeter.Poll();
+                }
+                if (_audioEngineRestart.IsRestarting)
+                {
+                    await Task.Delay(interval, cancellationToken);
+                    continue;
+                }
+
                 if (poll == VoicemeeterPollResult.Unavailable)
                 {
                     if (_voicemeeterReady)
@@ -614,7 +722,7 @@ public sealed class VoicemeeterMqttService : IAsyncDisposable
                              !await CheckVoicemeeterStateAsync(force: false, cancellationToken))
                     {
                         await MarkVoicemeeterUnavailableAsync(
-                            "parameter read failed after a change notification", cancellationToken);
+                            "parameter read failed after a change notification", cancellationToken, restartGeneration);
                     }
                 }
 
@@ -839,6 +947,24 @@ public sealed class VoicemeeterMqttService : IAsyncDisposable
             return;
         }
 
+        if (target.Kind == "voicemeeter" && target.Property == "restart")
+        {
+            if (!string.Equals(payload, "RESTART", StringComparison.Ordinal))
+            {
+                Log.Warning("Rejected invalid audio-engine restart payload on {Topic}", topic);
+                return;
+            }
+
+            var token = _cancellationSource?.Token ?? CancellationToken.None;
+            var restart = _audioEngineRestart.TryRestartAsync(token);
+            if (restart == null)
+                Log.Debug("Ignoring repeated audio-engine restart during recovery or cooldown");
+            else
+                // Keep the command reader available so duplicates are rejected immediately.
+                _audioEngineRestartTask = ObserveAudioEngineRestartAsync(restart, token);
+            return;
+        }
+
         var max = target.Kind == "strip" ? _topology.StripCount : _topology.BusCount;
         if (target.Index >= max)
         {
@@ -868,6 +994,92 @@ public sealed class VoicemeeterMqttService : IAsyncDisposable
         }
     }
 
+    private bool RequestAudioEngineRestart()
+    {
+        lock (_voicemeeterOperationSync)
+        {
+            if (!_voicemeeter.SetParameter("Command.Restart", 1.0f))
+                return false;
+
+            Interlocked.Increment(ref _audioEngineRestartGeneration);
+            return true;
+        }
+    }
+
+    private async Task<bool> WaitForAudioEngineRecoveryAsync(CancellationToken cancellationToken)
+    {
+        _voicemeeterReady = false;
+        Log.Information("Voicemeeter audio-engine restart requested; waiting for API recovery");
+
+        // Start the recovery deadline before network I/O so it bounds the entire check.
+        using var recoveryCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        recoveryCts.CancelAfter(TimeSpan.FromSeconds(30));
+        var recoveryToken = recoveryCts.Token;
+        try
+        {
+            if (_mqtt.IsConnected)
+                await _mqtt.PublishAsync(VoicemeeterStatusTopic, "offline", true,
+                    MqttQualityOfServiceLevel.AtLeastOnce, recoveryToken);
+
+            // The command is asynchronous; avoid treating the old parameter cache as recovery.
+            await Task.Delay(TimeSpan.FromSeconds(1), recoveryToken);
+            var consecutiveSuccessfulReads = 0;
+            while (true)
+            {
+                recoveryToken.ThrowIfCancellationRequested();
+                var poll = _voicemeeter.Poll(preserveSessionOnUnavailable: true);
+                var readable = poll != VoicemeeterPollResult.Unavailable &&
+                    Enumerable.Range(0, _topology.StripCount).All(i =>
+                        _voicemeeter.GetParameter($"Strip[{i}].Gain").HasValue &&
+                        _voicemeeter.GetParameter($"Strip[{i}].Mute").HasValue) &&
+                    Enumerable.Range(0, _topology.BusCount).All(i =>
+                        _voicemeeter.GetParameter($"Bus[{i}].Gain").HasValue &&
+                        _voicemeeter.GetParameter($"Bus[{i}].Mute").HasValue);
+                consecutiveSuccessfulReads = readable ? consecutiveSuccessfulReads + 1 : 0;
+                if (consecutiveSuccessfulReads >= 2)
+                {
+                    _voicemeeterReady = true;
+                    _mqtt.RequestReconciliation("Voicemeeter audio engine recovered after restart");
+                    return true;
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(250), recoveryToken);
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+    }
+
+    private async Task ObserveAudioEngineRestartAsync(
+        Task<AudioEngineRestartResult> restart, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var result = await restart;
+            if (result == AudioEngineRestartResult.Succeeded)
+            {
+                Log.Information("Voicemeeter API recovered after the audio-engine restart");
+                return;
+            }
+
+            await MarkVoicemeeterUnavailableAsync(
+                result == AudioEngineRestartResult.RequestFailed
+                    ? "audio-engine restart command failed"
+                    : "audio-engine restart recovery timed out", cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Service shutdown owns final availability and API disposal.
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Voicemeeter audio-engine restart failed");
+            await MarkVoicemeeterUnavailableAsync("audio-engine restart failed", cancellationToken);
+        }
+    }
+
     private async Task ApplyAndPublishActualAsync(MqttCommandTarget target, float requested)
     {
         var prefix = target.Kind == "strip" ? "Strip" : "Bus";
@@ -894,13 +1106,21 @@ public sealed class VoicemeeterMqttService : IAsyncDisposable
         await PublishStateAsync(topic, payload, true, MqttQualityOfServiceLevel.AtLeastOnce, force: true, token);
     }
 
-    private async Task MarkVoicemeeterUnavailableAsync(string reason, CancellationToken cancellationToken)
+    private async Task MarkVoicemeeterUnavailableAsync(
+        string reason, CancellationToken cancellationToken, int? restartGeneration = null)
     {
-        if (!_voicemeeterReady)
-            return;
+        lock (_voicemeeterOperationSync)
+        {
+            // A snapshot already in flight may see the expected restart interruption. The restart
+            // task will either confirm recovery or hand failure back here after releasing its guard.
+            if (_audioEngineRestart.IsRestarting ||
+                (restartGeneration.HasValue && restartGeneration.Value != _audioEngineRestartGeneration) ||
+                (!_voicemeeterReady && !_voicemeeter.IsInitialized))
+                return;
 
-        _voicemeeterReady = false;
-        _voicemeeter.Dispose();
+            _voicemeeterReady = false;
+            _voicemeeter.Dispose();
+        }
         Log.Warning("Voicemeeter backend marked unavailable: {Reason}", reason);
 
         if (_mqtt.IsConnected)
@@ -1087,6 +1307,7 @@ public sealed class VoicemeeterMqttService : IAsyncDisposable
         _inboundMessages.Writer.TryComplete();
         await AwaitBackgroundTask(_haBirthTask);
         await AwaitBackgroundTask(_mqttMessageTask);
+        await AwaitBackgroundTask(_audioEngineRestartTask);
 
         if (_mqtt.IsConnected)
         {
